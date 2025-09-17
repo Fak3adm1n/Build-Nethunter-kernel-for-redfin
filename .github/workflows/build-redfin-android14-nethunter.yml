@@ -221,7 +221,7 @@ jobs:
         done
       shell: bash
 
-    - name: Package AnyKernel3 (include kernel image, dtbs, firmware)
+- name: Package AnyKernel3 (include kernel image, dtbs, firmware)
       run: |
         set -e
         rm -rf anykernel
@@ -239,16 +239,15 @@ jobs:
         cp "$OUTIMG" anykernel/
         cp -r kernel_redfin/out/arch/arm64/boot/dts anykernel/ 2>/dev/null || true
 
-        # copy firmware into anykernel and modify install script to put firmware into /lib/firmware
+        # copy firmware into anykernel
         if [ -d firmware_for_anykernel ]; then
           mkdir -p anykernel/firmware
           cp -r firmware_for_anykernel/* anykernel/firmware/ || true
         fi
 
-        # patch anykernel/anykernel.sh: append firmware install lines if not already present
+        # patch anykernel/anykernel.sh
         AKSH=anykernel/anykernel.sh
-        if ! grep -q "install firmware" $AKSH 2>/dev/null; then
-          cat >> $AKSH <<'EOF'
+        cat >> "$AKSH" <<'EOF'
 # install firmware (added by CI)
 if [ -d "$AKF/firmware" ]; then
   ui_print "Installing firmware to /lib/firmware..."
@@ -256,10 +255,8 @@ if [ -d "$AKF/firmware" ]; then
   cp -r "$AKF/firmware"/* /lib/firmware/ 2>/dev/null || true
 fi
 EOF
-        fi
 
         (cd anykernel && zip -r9 ../${ARTIFACT_PREFIX}-AnyKernel.zip *)
-      shell: bash
 
     - name: Create simple Magisk firmware module (optional)
       run: |
