@@ -1,4 +1,4 @@
-name: Build Pixel5 (redfin) NetHunter Kernel - Android14 (Clang) + common patches/drivers
+name: Build Pixel5 (redfin) NetHunter Kernel - Android14 (Clang) + Drivers/Firmware
 
 on:
   workflow_dispatch:
@@ -6,19 +6,23 @@ on:
     branches: [ main ]
 
 env:
+  # Kernel / toolchain / helper repos
   KERNEL_REPO: https://android.googlesource.com/kernel/msm.git
+  # Branch for Android 14 redfin family - adjust if you prefer another tag
   KERNEL_BRANCH: android-msm-redbull-4.19-android14-release
   CLANG_REPO: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
   CLANG_TAG: android-14.0.0_r40
   ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
   NETHUNTER_PATCHES_REPO: https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-kernel.git
-  # 外置驱动示例（可按需修改/增删）
+
+  # example external driver repos (可按需增删)
   DRIVER_88X2BU: https://github.com/morrownr/88x2bu-20210702.git
   DRIVER_RTL8812AU: https://github.com/aircrack-ng/rtl8812au.git
   DRIVER_RTW88: https://github.com/lwfinger/rtw88.git
   DRIVER_ATH9K_HTC: https://github.com/qca/open-ath9k-htc.git
-  DRIVER_LIRC_KERNEL: https://github.com/torvalds/linux.git  # 仅示例：LIRC / IR 栈通常在内核 tree 或 staging
-  # 你可以在 repo 中添加自定义 patch 目录：kernel_patches/*.patch
+
+  # artifact / release names
+  ARTIFACT_PREFIX: pixel5-android14-nethunter
 
 jobs:
   build:
@@ -26,18 +30,18 @@ jobs:
     timeout-minutes: 360
 
     steps:
-    - name: Checkout current repo
+    - name: Checkout this repo (patches / kernel_patches etc.)
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
-    - name: Install build deps
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y bc bison build-essential ccache flex git \
-          libncurses5-dev libssl-dev python3 wget zip unzip rsync llvm ca-certificates
+          libncurses5-dev libssl-dev python3 wget zip unzip rsync llvm lld
 
-    - name: Fetch kernel source (redfin Android14)
+    - name: Fetch Pixel5 (redfin) kernel source (Android 14)
       run: |
         set -e
         rm -rf kernel_redfin
@@ -50,60 +54,110 @@ jobs:
         git rev-parse --short HEAD > ../kernel_redfin_rev.txt
       shell: bash
 
-    - name: Fetch NetHunter patch repository (patch sets)
+    - name: Fetch Kali NetHunter patch repo (if reachable)
       run: |
+        set -e
         rm -rf nethunter_patches
         git clone --depth=1 ${NETHUNTER_PATCHES_REPO} nethunter_patches || true
-        # The Kali repo stores many patch directories; we'll try to pick ones for 4.19 family if present
         ls -la nethunter_patches || true
       shell: bash
 
-    - name: Apply local and NetHunter patches (if any)
+    - name: Apply patches (local kernel_patches/ then nethunter patches if found)
       run: |
         set -e
         cd kernel_redfin
-        # apply any patches shipped inside this repo (kernel_patches/)
+        # apply local patches from repo/kernel_patches (you can add patches in your repo)
         if [ -d ../kernel_patches ]; then
-          echo "Applying local repo patches..."
+          echo "Applying local kernel_patches from the repository..."
           for p in ../kernel_patches/*.patch; do
             [ -f "$p" ] || continue
             echo "Applying $p"
-            git apply --index "$p" || (echo "git apply failed for $p"; git apply "$p" -p1 || true)
+            git apply --index "$p" || (echo "git apply failed for $p, trying patch -p1" && patch -p1 < "$p" || true)
           done
+        else
+          echo "No local kernel_patches directory"
         fi
-        # Try apply Kali NetHunter patches for 4.x kernels if directory exists
-        # This tries a few likely directories; adjust if necessary.
-        if [ -d ../nethunter_patches/patches/4.19 ] ; then
+
+        # Try to apply NetHunter patches for 4.19 family if available
+        if [ -d ../nethunter_patches/patches/4.19 ]; then
           echo "Applying Kali NetHunter 4.19 patches..."
           for x in ../nethunter_patches/patches/4.19/*.patch; do
             [ -f "$x" ] || continue
-            echo "patch -p1 < $x"
-            patch -p1 < "$x" || echo "patch failed for $x"
+            echo "Applying $x"
+            patch -p1 < "$x" || echo "patch error for $x"
           done
         else
-          echo "No Kali 4.19 patch dir found; skipping automatic apply."
+          echo "No NetHunter 4.19 patch dir found; skipping."
         fi
-        # commit changes so later 'make' sees them
+
+        # Commit any applied changes so the build sees them
         git add -A || true
-        git commit -m "Apply nethunter/local patches (auto)" || true
+        git commit -m "Apply local and nethunter patches (auto)" || true
       shell: bash
 
-    - name: Fetch AOSP Clang prebuilts
+    - name: Fetch AOSP Clang prebuilts (Android 14)
       run: |
+        set -e
         rm -rf prebuilts_clang
-        git clone --depth=1 --branch ${CLANG_TAG} ${CLANG_REPO} prebuilts_clang
+        git clone --depth=1 --branch ${CLANG_TAG} ${CLANG_REPO} prebuilts_clang || true
         CLANG_BIN=$(find prebuilts_clang -type d -name "clang-*" -maxdepth 3 -print -quit)/bin || true
         if [ -z "$CLANG_BIN" ]; then
           CLANG_BIN=$(find prebuilts_clang -type d -name "bin" -path "*/clang-*" -print -quit) || true
         fi
         echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
         echo "PATH=$CLANG_BIN:$PATH" >> $GITHUB_ENV
+        echo "Found clang: $CLANG_BIN"
       shell: bash
 
-    - name: Show clang version (sanity)
+    - name: Sanity - show clang version
       run: |
         which clang || true
         clang --version || true
+
+    - name: Ensure rt2800/rt2x00 options enabled (RT3070 support)
+      working-directory: kernel_redfin
+      run: |
+        set -e
+        export PATH="$CLANG_BIN:$PATH"
+        export ARCH=arm64
+        # Build small helper if not present
+        if [ ! -f scripts/config ]; then
+          echo "Building scripts/config..."
+          make O=out scripts || true
+        fi
+        # enable rt2x00 stack and rt2800usb as module
+        ./scripts/config --file .config --enable CONFIG_RT2X00_LIB || true
+        ./scripts/config --file .config --enable CONFIG_RT2800_LIB || true
+        ./scripts/config --file .config --enable CONFIG_RT2800USB || true
+        ./scripts/config --file .config --enable CONFIG_RT2X00_USB || true
+        # fallback append if not found
+        if ! grep -q '^CONFIG_RT2800USB' .config 2>/dev/null; then
+          echo 'CONFIG_RT2X00_LIB=m' >> .config || true
+          echo 'CONFIG_RT2800_LIB=m' >> .config || true
+          echo 'CONFIG_RT2800USB=m' >> .config || true
+          echo 'CONFIG_RT2X00_USB=m' >> .config || true
+        fi
+        # regenerate config
+        make O=out olddefconfig || true
+      shell: bash
+
+    - name: Download RT3070 firmware (linux-firmware) for packaging
+      run: |
+        set -e
+        rm -rf linux-firmware-tmp firmware_for_anykernel
+        git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git linux-firmware-tmp || true
+        mkdir -p firmware_for_anykernel
+        # copy common rt2x00 firmware (rt2870.bin often used)
+        if [ -f linux-firmware-tmp/rt2870.bin ]; then
+          cp linux-firmware-tmp/rt2870.bin firmware_for_anykernel/rt2870.bin
+          cp linux-firmware-tmp/rt2870.bin firmware_for_anykernel/rt3070.bin || true
+        elif [ -f linux-firmware-tmp/rt3070.bin ]; then
+          cp linux-firmware-tmp/rt3070.bin firmware_for_anykernel/rt3070.bin
+        else
+          echo "rt2870/rt3070 firmware not found in linux-firmware repo; continuing."
+        fi
+        ls -la firmware_for_anykernel || true
+      shell: bash
 
     - name: Prepare kernel defconfig (redfin)
       working-directory: kernel_redfin
@@ -115,13 +169,13 @@ jobs:
         if [ -f arch/arm64/configs/redfin_defconfig ]; then
           make O=out redfin_defconfig
         else
-          echo "redfin_defconfig not found"
-          ls arch/arm64/configs | head -n 50
+          echo "redfin_defconfig not found; listing alternative configs..."
+          ls arch/arm64/configs | head -n 60
           exit 1
         fi
       shell: bash
 
-    - name: Build kernel (Image.gz-dtb, dtbs, modules) with clang
+    - name: Build kernel (Image.gz-dtb, dtbs, modules) with clang/lld
       working-directory: kernel_redfin
       run: |
         set -e
@@ -138,182 +192,36 @@ jobs:
         make -j$(nproc) O=out Image.gz-dtb dtbs modules LLVM=1
       shell: bash
 
-
-
- name: Build Pixel5 (redfin) NetHunter Kernel - Android14 (Clang) + common patches/drivers
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-
-env:
-  KERNEL_REPO: https://android.googlesource.com/kernel/msm.git
-  KERNEL_BRANCH: android-msm-redbull-4.19-android14-release
-  CLANG_REPO: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
-  CLANG_TAG: android-14.0.0_r40
-  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
-  NETHUNTER_PATCHES_REPO: https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-kernel.git
-  # 外置驱动示例（可按需修改/增删）
-  DRIVER_88X2BU: https://github.com/morrownr/88x2bu-20210702.git
-  DRIVER_RTL8812AU: https://github.com/aircrack-ng/rtl8812au.git
-  DRIVER_RTW88: https://github.com/lwfinger/rtw88.git
-  DRIVER_ATH9K_HTC: https://github.com/qca/open-ath9k-htc.git
-  DRIVER_LIRC_KERNEL: https://github.com/torvalds/linux.git  # 仅示例：LIRC / IR 栈通常在内核 tree 或 staging
-  # 你可以在 repo 中添加自定义 patch 目录：kernel_patches/*.patch
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
-
-    steps:
-    - name: Checkout current repo
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Install build deps
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bc bison build-essential ccache flex git \
-          libncurses5-dev libssl-dev python3 wget zip unzip rsync llvm ca-certificates
-
-    - name: Fetch kernel source (redfin Android14)
+    - name: Build external drivers (modules) - examples
       run: |
         set -e
-        rm -rf kernel_redfin
-        mkdir kernel_redfin
-        cd kernel_redfin
-        git init
-        git remote add origin ${KERNEL_REPO}
-        git fetch --depth=1 origin ${KERNEL_BRANCH}
-        git checkout FETCH_HEAD
-        git rev-parse --short HEAD > ../kernel_redfin_rev.txt
-      shell: bash
-
-    - name: Fetch NetHunter patch repository (patch sets)
-      run: |
-        rm -rf nethunter_patches
-        git clone --depth=1 ${NETHUNTER_PATCHES_REPO} nethunter_patches || true
-        # The Kali repo stores many patch directories; we'll try to pick ones for 4.19 family if present
-        ls -la nethunter_patches || true
-      shell: bash
-
-    - name: Apply local and NetHunter patches (if any)
-      run: |
-        set -e
-        cd kernel_redfin
-        # apply any patches shipped inside this repo (kernel_patches/)
-        if [ -d ../kernel_patches ]; then
-          echo "Applying local repo patches..."
-          for p in ../kernel_patches/*.patch; do
-            [ -f "$p" ] || continue
-            echo "Applying $p"
-            git apply --index "$p" || (echo "git apply failed for $p"; git apply "$p" -p1 || true)
-          done
-        fi
-        # Try apply Kali NetHunter patches for 4.x kernels if directory exists
-        # This tries a few likely directories; adjust if necessary.
-        if [ -d ../nethunter_patches/patches/4.19 ] ; then
-          echo "Applying Kali NetHunter 4.19 patches..."
-          for x in ../nethunter_patches/patches/4.19/*.patch; do
-            [ -f "$x" ] || continue
-            echo "patch -p1 < $x"
-            patch -p1 < "$x" || echo "patch failed for $x"
-          done
-        else
-          echo "No Kali 4.19 patch dir found; skipping automatic apply."
-        fi
-        # commit changes so later 'make' sees them
-        git add -A || true
-        git commit -m "Apply nethunter/local patches (auto)" || true
-      shell: bash
-
-    - name: Fetch AOSP Clang prebuilts
-      run: |
-        rm -rf prebuilts_clang
-        git clone --depth=1 --branch ${CLANG_TAG} ${CLANG_REPO} prebuilts_clang
-        CLANG_BIN=$(find prebuilts_clang -type d -name "clang-*" -maxdepth 3 -print -quit)/bin || true
-        if [ -z "$CLANG_BIN" ]; then
-          CLANG_BIN=$(find prebuilts_clang -type d -name "bin" -path "*/clang-*" -print -quit) || true
-        fi
-        echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
-        echo "PATH=$CLANG_BIN:$PATH" >> $GITHUB_ENV
-      shell: bash
-
-    - name: Show clang version (sanity)
-      run: |
-        which clang || true
-        clang --version || true
-
-    - name: Prepare kernel defconfig (redfin)
-      working-directory: kernel_redfin
-      run: |
-        set -e
-        export PATH="$CLANG_BIN:$PATH"
-        export ARCH=arm64
-        export CC=clang
-        if [ -f arch/arm64/configs/redfin_defconfig ]; then
-          make O=out redfin_defconfig
-        else
-          echo "redfin_defconfig not found"
-          ls arch/arm64/configs | head -n 50
-          exit 1
-        fi
-      shell: bash
-
-    - name: Build kernel (Image.gz-dtb, dtbs, modules) with clang
-      working-directory: kernel_redfin
-      run: |
-        set -e
-        export PATH="$CLANG_BIN:$PATH"
-        export ARCH=arm64
-        export CC=clang
-        export LD=ld.lld
-        export AR=llvm-ar
-        export NM=llvm-nm
-        export OBJCOPY=llvm-objcopy
-        export OBJDUMP=llvm-objdump
-        export STRIP=llvm-strip
-        export READELF=llvm-readelf
-        make -j$(nproc) O=out Image.gz-dtb dtbs modules LLVM=1
-      shell: bash
-
-    - name: Build & install commonly used external drivers as modules
-      run: |
-        set -e
-        mkdir -p external_drivers
+        rm -rf external_drivers built_modules
+        mkdir -p external_drivers built_modules
         cd external_drivers
-
-        # Clone example external driver repos (you can add/remove)
         git clone --depth=1 ${DRIVER_88X2BU} 88x2bu || true
         git clone --depth=1 ${DRIVER_RTL8812AU} rtl8812au || true
         git clone --depth=1 ${DRIVER_RTW88} rtw88 || true
         git clone --depth=1 ${DRIVER_ATH9K_HTC} ath9k_htc || true
 
-        KERNEL_DIR="../kernel_redfin"
-        # prepare kernel for external module builds
-        make -C "$KERNEL_DIR" O=out modules_prepare
+        KDIR="../kernel_redfin"
+        make -C "$KDIR" O=out modules_prepare
 
-        # For each driver try to build as external module (if it has a Makefile)
         for d in */ ; do
           [ -d "$d" ] || continue
           cd "$d"
-          if [ -f Makefile ] || [ -f DKMS.conf ]; then
-            echo "Building external module in $(pwd)"
-            make -C "$KERNEL_DIR" M=$(pwd) O=out -j$(nproc) || echo "Build failed for $(pwd)"
-            # copy resulting .ko files to artifacts folder
+          echo "Attempting build in $(pwd)"
+          if [ -f Makefile ]; then
+            make -C "$KDIR" M=$(pwd) O=out -j$(nproc) || echo "Build failed for $(pwd)"
             mkdir -p ../../built_modules/$(basename $d)
             find . -name "*.ko" -exec cp --parents {} ../../built_modules/$(basename $d)/ \; || true
           else
-            echo "No Makefile in $(pwd), skipping build"
+            echo "No Makefile in $(pwd), skipping"
           fi
           cd ..
         done
       shell: bash
 
-    - name: Package AnyKernel3 zip (kernel image + dtbs)
+    - name: Package AnyKernel3 (include kernel image, dtbs, firmware)
       run: |
         set -e
         rm -rf anykernel
@@ -324,88 +232,95 @@ jobs:
         elif [ -f kernel_redfin/out/arch/arm64/boot/Image.gz ]; then
           OUTIMG=kernel_redfin/out/arch/arm64/boot/Image.gz
         else
-          echo "Kernel image not found"
+          echo "Kernel image not found; aborting package step"
           ls -la kernel_redfin/out/arch/arm64/boot || true
           exit 1
         fi
         cp "$OUTIMG" anykernel/
         cp -r kernel_redfin/out/arch/arm64/boot/dts anykernel/ 2>/dev/null || true
-        (cd anykernel && zip -r9 ../Pixel5-Android14-Nethunter-Kernel.zip *)
-      shell: bash
 
-    - name: Upload artifacts (kernel zip, kernel image, built modules)
-      uses: actions/upload-artifact@v4
-      with:
-        name: pixel5-android14-nethunter
-        path: |
-          Pixel5-Android14-Nethunter-Kernel.zip
-          kernel_redfin/out/arch/arm64/boot/Image.gz-dtb
-          kernel_redfin/out/arch/arm64/boot/Image.gz
-          built_modules/**
-
-
-
-
-
-    - name: Build & install commonly used external drivers as modules
-      run: |
-        set -e
-        mkdir -p external_drivers
-        cd external_drivers
-
-        # Clone example external driver repos (you can add/remove)
-        git clone --depth=1 ${DRIVER_88X2BU} 88x2bu || true
-        git clone --depth=1 ${DRIVER_RTL8812AU} rtl8812au || true
-        git clone --depth=1 ${DRIVER_RTW88} rtw88 || true
-        git clone --depth=1 ${DRIVER_ATH9K_HTC} ath9k_htc || true
-
-        KERNEL_DIR="../kernel_redfin"
-        # prepare kernel for external module builds
-        make -C "$KERNEL_DIR" O=out modules_prepare
-
-        # For each driver try to build as external module (if it has a Makefile)
-        for d in */ ; do
-          [ -d "$d" ] || continue
-          cd "$d"
-          if [ -f Makefile ] || [ -f DKMS.conf ]; then
-            echo "Building external module in $(pwd)"
-            make -C "$KERNEL_DIR" M=$(pwd) O=out -j$(nproc) || echo "Build failed for $(pwd)"
-            # copy resulting .ko files to artifacts folder
-            mkdir -p ../../built_modules/$(basename $d)
-            find . -name "*.ko" -exec cp --parents {} ../../built_modules/$(basename $d)/ \; || true
-          else
-            echo "No Makefile in $(pwd), skipping build"
-          fi
-          cd ..
-        done
-      shell: bash
-
-    - name: Package AnyKernel3 zip (kernel image + dtbs)
-      run: |
-        set -e
-        rm -rf anykernel
-        git clone ${ANYKERNEL_REPO} anykernel
-        OUTIMG=""
-        if [ -f kernel_redfin/out/arch/arm64/boot/Image.gz-dtb ]; then
-          OUTIMG=kernel_redfin/out/arch/arm64/boot/Image.gz-dtb
-        elif [ -f kernel_redfin/out/arch/arm64/boot/Image.gz ]; then
-          OUTIMG=kernel_redfin/out/arch/arm64/boot/Image.gz
-        else
-          echo "Kernel image not found"
-          ls -la kernel_redfin/out/arch/arm64/boot || true
-          exit 1
+        # copy firmware into anykernel and modify install script to put firmware into /lib/firmware
+        if [ -d firmware_for_anykernel ]; then
+          mkdir -p anykernel/firmware
+          cp -r firmware_for_anykernel/* anykernel/firmware/ || true
         fi
-        cp "$OUTIMG" anykernel/
-        cp -r kernel_redfin/out/arch/arm64/boot/dts anykernel/ 2>/dev/null || true
-        (cd anykernel && zip -r9 ../Pixel5-Android14-Nethunter-Kernel.zip *)
+
+        # patch anykernel/anykernel.sh: append firmware install lines if not already present
+        AKSH=anykernel/anykernel.sh
+        if ! grep -q "install firmware" $AKSH 2>/dev/null; then
+          cat >> $AKSH <<'EOF'
+# install firmware (added by CI)
+if [ -d "$AKF/firmware" ]; then
+  ui_print "Installing firmware to /lib/firmware..."
+  mkdir -p /lib/firmware || true
+  cp -r "$AKF/firmware"/* /lib/firmware/ 2>/dev/null || true
+fi
+EOF
+        fi
+
+        (cd anykernel && zip -r9 ../${ARTIFACT_PREFIX}-AnyKernel.zip *)
       shell: bash
 
-    - name: Upload artifacts (kernel zip, kernel image, built modules)
+    - name: Create simple Magisk firmware module (optional)
+      run: |
+        set -e
+        rm -rf magisk_firmware
+        mkdir -p magisk_firmware
+        cat > magisk_firmware/module.prop <<'EOF'
+id=netkiller_firmware
+name=NetHunter RT3070 Firmware
+version=1.0
+versionCode=1
+author=CI
+description=Installs rt2870/rt3070 firmware into /vendor/firmware or /lib/firmware
+EOF
+        mkdir -p magisk_firmware/system_root
+        # place firmware into module under system_root/vendor/firmware (prefer vendor)
+        if [ -d firmware_for_anykernel ]; then
+          mkdir -p magisk_firmware/system_root/vendor/firmware
+          cp -r firmware_for_anykernel/* magisk_firmware/system_root/vendor/firmware/ || true
+        fi
+        # zip module
+        (cd magisk_firmware && zip -r9 ../${ARTIFACT_PREFIX}-magisk-firmware.zip *)
+      shell: bash
+
+    - name: Collect artifacts and show outputs
+      run: |
+        echo "Artifacts produced:"
+        ls -la ${ARTIFACT_PREFIX}-AnyKernel.zip || true
+        ls -la ${ARTIFACT_PREFIX}-magisk-firmware.zip || true
+        ls -la kernel_redfin/out/arch/arm64/boot || true
+        ls -la built_modules || true
+
+    - name: Upload artifacts (kernel zip, magisk module, kernel image, modules)
       uses: actions/upload-artifact@v4
       with:
-        name: pixel5-android14-nethunter
+        name: ${{ env.ARTIFACT_PREFIX }}
         path: |
-          Pixel5-Android14-Nethunter-Kernel.zip
+          ${ARTIFACT_PREFIX}-AnyKernel.zip
+          ${ARTIFACT_PREFIX}-magisk-firmware.zip
           kernel_redfin/out/arch/arm64/boot/Image.gz-dtb
           kernel_redfin/out/arch/arm64/boot/Image.gz
           built_modules/**
+
+    - name: Create GitHub Release and attach artifacts (if triggered by manual workflow_dispatch)
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: build-${{ github.run_id }}
+        name: Pixel5 NetHunter build ${{ github.run_id }}
+        body: |
+          Automated build of Pixel5 (redfin) kernel (Android14) with NetHunter patches and drivers.
+          Kernel rev: $(cat kernel_redfin_rev.txt 2>/dev/null || echo "unknown")
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload release assets (if release created)
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url || '' }}
+        asset_path: ${ARTIFACT_PREFIX}-AnyKernel.zip
+        asset_name: ${ARTIFACT_PREFIX}-AnyKernel.zip
+        asset_content_type: application/zip
+      # Note: upload-release-asset requires the upload_url from create-release; softprops/action-gh-release sets outputs differently in some contexts.
